@@ -8,6 +8,7 @@ import pandas.util.testing as tm
 import pytest
 
 import dask
+import dask.multiprocessing
 from dask.utils import tmpdir, tmpfile
 import dask.dataframe as dd
 from dask.dataframe.io.parquet import read_parquet, to_parquet
@@ -373,10 +374,6 @@ def test_empty_partition(fn):
     assert_eq(ddf2.compute(), ddf3.compute(), check_names=False,
               check_index=False)
 
-    ddf2 = ddf[ddf.a <= -5]
-    with pytest.raises(ValueError):
-        ddf2.to_parquet(fn)
-
 
 def test_timestamp_index():
     with tmpfile() as fn:
@@ -389,7 +386,6 @@ def test_timestamp_index():
 
 
 @pytest.mark.skipif(not pyarrow, reason='pyarrow not found')
-@pytest.mark.xfail(reason="to_parquet does not write nulls by default")
 def test_to_parquet_default_writes_nulls():
     import pyarrow.parquet as pq
 
@@ -399,4 +395,80 @@ def test_to_parquet_default_writes_nulls():
     with tmpfile() as fn:
         ddf.to_parquet(fn)
         table = pq.read_table(fn)
-        assert table[0].null_count == 2
+        assert table[1].null_count == 2
+
+
+def test_partition_on(tmpdir):
+    tmpdir = str(tmpdir)
+    df = pd.DataFrame({'a': np.random.choice(['A', 'B', 'C'], size=100),
+                       'b': np.random.random(size=100),
+                       'c': np.random.randint(1, 5, size=100)})
+    d = dd.from_pandas(df, npartitions=2)
+    d.to_parquet(tmpdir, partition_on=['a'])
+    out = dd.read_parquet(tmpdir, engine='fastparquet').compute()
+    for val in df.a.unique():
+        assert set(df.b[df.a == val]) == set(out.b[out.a == val])
+
+
+def test_filters(fn):
+
+    df = pd.DataFrame({'at': ['ab', 'aa', 'ba', 'da', 'bb']})
+    ddf = dd.from_pandas(df, npartitions=1)
+
+    # Ok with 1 partition and filters
+    ddf.repartition(npartitions=1, force=True).to_parquet(fn, write_index=False)
+    ddf2 = dd.read_parquet(fn, index=False,
+                           filters=[('at', '==', 'aa')]).compute()
+    assert_eq(ddf2, ddf)
+
+    # with >1 partition and no filters
+    ddf.repartition(npartitions=2, force=True).to_parquet(fn)
+    dd.read_parquet(fn).compute()
+    assert_eq(ddf2, ddf)
+
+    # with >1 partition and filters using base fastparquet
+    ddf.repartition(npartitions=2, force=True).to_parquet(fn)
+    df2 = fastparquet.ParquetFile(fn).to_pandas(filters=[('at', '==', 'aa')])
+    assert len(df2) > 0
+
+    # with >1 partition and filters
+    ddf.repartition(npartitions=2, force=True).to_parquet(fn)
+    dd.read_parquet(fn, filters=[('at', '==', 'aa')]).compute()
+    assert len(ddf2) > 0
+
+
+def test_no_index(fn):
+    df = pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+    ddf = dd.from_pandas(df, npartitions=2)
+    ddf.to_parquet(fn, write_index=False)
+    dd.read_parquet(fn).compute()
+
+
+@pytest.mark.parametrize('get', [dask.threaded.get, dask.multiprocessing.get])
+def test_to_parquet_lazy(tmpdir, get):
+    tmpdir = str(tmpdir)
+    df = pd.DataFrame({'a': [1, 2, 3, 4],
+                       'b': [1., 2., 3., 4.]})
+    df.index.name = 'index'
+    ddf = dd.from_pandas(df, npartitions=2)
+    value = ddf.to_parquet(tmpdir, compute=False)
+
+    assert hasattr(value, 'dask')
+    # assert not os.path.exists(tmpdir)
+    value.compute(get=get)
+    assert os.path.exists(tmpdir)
+
+    ddf2 = dd.read_parquet(tmpdir)
+
+    assert_eq(ddf, ddf2)
+
+
+def test_empty(fn):
+    df = pd.DataFrame({'a': ['a', 'b', 'b'], 'b': [4, 5, 6]})[0:0]
+    ddf = dd.from_pandas(df, npartitions=2)
+    ddf.to_parquet(fn, write_index=False)
+    files = os.listdir(fn)
+    assert '_metadata' in files
+    out = dd.read_parquet(fn).compute()
+    assert len(out) == 0
+    assert_eq(out, df)

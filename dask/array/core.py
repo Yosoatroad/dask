@@ -6,6 +6,7 @@ from collections import Iterator
 from functools import partial, wraps
 import inspect
 from itertools import product
+import math
 from numbers import Integral, Number
 import operator
 from operator import add, getitem, mul
@@ -491,7 +492,8 @@ def apply_infer_dtype(func, args, kwargs, funcname, suggest_dtype=True):
     args = [np.ones((1,) * x.ndim, dtype=x.dtype)
             if isinstance(x, Array) else x for x in args]
     try:
-        o = func(*args, **kwargs)
+        with np.errstate(all='ignore'):
+            o = func(*args, **kwargs)
     except Exception as e:
         exc_type, exc_value, exc_traceback = sys.exc_info()
         tb = ''.join(traceback.format_tb(exc_traceback))
@@ -533,9 +535,13 @@ def map_blocks(func, *args, **kwargs):
     new_axis : number or iterable, optional
         New dimensions created by the function. Note that these are applied
         after ``drop_axis`` (if present).
+    token : string, optional
+        The key prefix to use for the output array. If not provided, will be
+        determined from the function name.
     name : string, optional
-        The key name to use for the array. If not provided, will be determined
-        by a hash of the arguments.
+        The key name to use for the output array. Note that this fully
+        specifies the output key name, and must be unique. If not provided,
+        will be determined by a hash of the arguments.
     **kwargs :
         Other keyword arguments to pass to function. Values must be constants
         (not dask.arrays)
@@ -608,10 +614,11 @@ def map_blocks(func, *args, **kwargs):
     >>> def func(block, block_id=None):
     ...     pass
 
-    You may specify the name of the resulting task in the graph with the
-    optional ``name`` keyword argument.
+    You may specify the key name prefix of the resulting task in the graph with
+    the optional ``token`` keyword argument.
 
-    >>> y = x.map_blocks(lambda x: x + 1, name='increment')
+    >>> x.map_blocks(lambda x: x + 1, token='increment')  # doctest: +SKIP
+    dask.array<increment, shape=(100,), dtype=int64, chunksize=(10,)>
     """
     if not callable(func):
         msg = ("First argument must be callable function, not %s\n"
@@ -619,7 +626,10 @@ def map_blocks(func, *args, **kwargs):
                "   or:   da.map_blocks(function, x, y, z)")
         raise TypeError(msg % type(func).__name__)
     name = kwargs.pop('name', None)
-    name = name or '%s-%s' % (funcname(func), tokenize(func, args, **kwargs))
+    token = kwargs.pop('token', None)
+    if not name:
+        name = '%s-%s' % (token or funcname(func),
+                          tokenize(token or func, args, **kwargs))
     dtype = kwargs.pop('dtype', None)
     chunks = kwargs.pop('chunks', None)
     drop_axis = kwargs.pop('drop_axis', [])
@@ -1418,6 +1428,30 @@ class Array(Base):
     def __rxor__(self, other):
         return elemwise(operator.xor, other, self)
 
+    def __matmul__(self, other):
+        if not hasattr(other, 'ndim'):
+            other = np.asarray(other)  # account for array-like RHS
+        if other.ndim > 2:
+            msg = ('The matrix multiplication operator (@) is not yet '
+                   'implemented for higher-dimensional Dask arrays. Try '
+                   '`dask.array.tensordot` and see the discussion at '
+                   'https://github.com/dask/dask/pull/2349 for details.')
+            raise NotImplementedError(msg)
+        return tensordot(self, other, axes=((self.ndim - 1,),
+                                            (other.ndim - 2,)))
+
+    def __rmatmul__(self, other):
+        if not hasattr(other, 'ndim'):
+            other = np.asarray(other)  # account for array-like on LHS
+        if self.ndim > 2:
+            msg = ('The matrix multiplication operator (@) is not yet '
+                   'implemented for higher-dimensional Dask arrays. Try '
+                   '`dask.array.tensordot` and see the discussion at '
+                   'https://github.com/dask/dask/pull/2349 for details.')
+            raise NotImplementedError(msg)
+        return tensordot(other, self, axes=((other.ndim - 1,),
+                                            (self.ndim - 2,)))
+
     @wraps(np.any)
     def any(self, axis=None, keepdims=False, split_every=None):
         from .reductions import any
@@ -1691,8 +1725,9 @@ class Array(Base):
         dask.array.from_delayed
         """
         from ..delayed import Delayed
-        return np.array(ndeepmap(self.ndim, lambda k: Delayed(k, self.dask), self._keys()),
-                        dtype=object)
+        dsk = self._optimize(self.dask, self._keys())
+        L = ndeepmap(self.ndim, lambda k: Delayed(k, dsk), self._keys())
+        return np.array(L, dtype=object)
 
     @wraps(np.repeat)
     def repeat(self, repeats, axis=None):
@@ -1755,7 +1790,7 @@ def normalize_chunks(chunks, shape=None):
             raise ValueError("Empty tuples are not allowed in chunks. Express "
                              "zero length dimensions with 0(s) in chunks")
 
-    return tuple(map(tuple, chunks))
+    return tuple(tuple(int(x) if not math.isnan(x) else x for x in c) for c in chunks)
 
 
 def from_array(x, chunks, name=None, lock=False, fancy=True, getitem=None):
@@ -2710,7 +2745,23 @@ See the following documentation page for details:
 def where(condition, x=None, y=None):
     if x is None or y is None:
         raise TypeError(where_error_message)
-    return choose(condition, [y, x])
+
+    x = asarray(x)
+    y = asarray(y)
+
+    shape = broadcast_shapes(x.shape, y.shape)
+    dtype = np.promote_types(x.dtype, y.dtype)
+
+    x = broadcast_to(x, shape).astype(dtype)
+    y = broadcast_to(y, shape).astype(dtype)
+
+    if isinstance(condition, (bool, np.bool8)):
+        if condition:
+            return x
+        else:
+            return y
+    else:
+        return choose(condition, [y, x])
 
 
 @wraps(chunk.coarsen)
@@ -2801,7 +2852,12 @@ def insert(arr, obj, values, axis):
 
 @wraps(chunk.broadcast_to)
 def broadcast_to(x, shape):
+    x = asarray(x)
     shape = tuple(shape)
+
+    if x.shape == shape:
+        return x
+
     ndim_new = len(shape) - x.ndim
     if ndim_new < 0 or any(new != old
                            for new, old in zip(shape[ndim_new:], x.shape)
@@ -3809,7 +3865,7 @@ def repeat(a, repeats, axis=None):
         else:
             raise NotImplementedError("Must supply an integer axis value")
 
-    if not isinstance(repeats, int):
+    if not isinstance(repeats, Integral):
         raise NotImplementedError("Only integer valued repeats supported")
 
     if repeats == 1:

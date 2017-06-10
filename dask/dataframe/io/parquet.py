@@ -2,7 +2,7 @@ from __future__ import absolute_import, division, print_function
 
 import numpy as np
 import pandas as pd
-from toolz import first, partial
+from toolz import partial
 
 from ..core import DataFrame, Series
 from ..utils import UNKNOWN_CATEGORIES
@@ -64,24 +64,12 @@ def _read_fastparquet(fs, paths, myopen, columns=None, filters=None,
            not(fastparquet.api.filter_out_stats(rg, filters, pf.schema)) and
            not(fastparquet.api.filter_out_cats(rg, filters))]
 
-    # Find an index among the partially sorted columns
-    minmax = fastparquet.api.sorted_partitioned_columns(pf)
-
     if index is False:
         index_col = None
-    elif len(minmax) == 1:
-        index_col = first(minmax)
-    elif len(minmax) > 1:
-        if index:
-            index_col = index
-        elif 'index' in minmax:
-            index_col = 'index'
-        else:
-            raise ValueError("Multiple possible indexes exist: %s.  "
-                             "Please select one with index='index-name'"
-                             % sorted(minmax))
+    elif index is None:
+        index_col = pf._get_index()
     else:
-        index_col = None
+        index_col = index
 
     if columns is None:
         all_columns = tuple(pf.columns + list(pf.cats))
@@ -99,7 +87,8 @@ def _read_fastparquet(fs, paths, myopen, columns=None, filters=None,
         categories = pf.categories
     dtypes = pf._dtypes(categories)
 
-    meta = _meta_from_dtypes(all_columns, pf.columns, dtypes)
+    meta = _meta_from_dtypes(all_columns, tuple(pf.columns + list(pf.cats)),
+                             dtypes)
 
     for cat in categories:
         meta[cat] = pd.Series(pd.Categorical([],
@@ -118,12 +107,24 @@ def _read_fastparquet(fs, paths, myopen, columns=None, filters=None,
            for i, rg in enumerate(rgs)}
 
     if index_col:
-        divisions = list(minmax[index_col]['min']) + [minmax[index_col]['max'][-1]]
+        minmax = fastparquet.api.sorted_partitioned_columns(pf)
+        if index_col in minmax:
+            divisions = (list(minmax[index_col]['min']) +
+                         [minmax[index_col]['max'][-1]])
+            divisions = [divisions[i] for i, rg in enumerate(pf.row_groups)
+                         if rg in rgs] + [divisions[-1]]
+        else:
+            divisions = (None,) * (len(rgs) + 1)
     else:
         divisions = (None,) * (len(rgs) + 1)
 
     if isinstance(divisions[0], np.datetime64):
         divisions = [pd.Timestamp(d) for d in divisions]
+
+    if not dsk:
+        # empty dataframe
+        dsk = {(name, 0): meta}
+        divisions = (None, None)
 
     return out_type(dsk, name, meta, divisions)
 
@@ -290,9 +291,10 @@ def read_parquet(path, columns=None, filters=None, categories=None, index=None,
                              categories=categories, index=index)
 
 
-def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
+def to_parquet(path, df, compression=None, write_index=None, has_nulls=True,
                fixed_text=None, object_encoding=None, storage_options=None,
-               append=False, ignore_divisions=False):
+               append=False, ignore_divisions=False, partition_on=None,
+               compute=True):
     """Store Dask.dataframe to Parquet files
 
     Notes
@@ -311,11 +313,11 @@ def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
     write_index : boolean
         Whether or not to write the index.  Defaults to True *if* divisions are
         known.
-    has_nulls : bool, list or None
+    has_nulls : bool, list or 'infer'
         Specifies whether to write NULLs information for columns. If bools,
-        apply to all columns, if list, use for only the named columns, if None,
-        use only for columns which don't have a sentinel NULL marker (currently
-        object columns only).
+        apply to all columns, if list, use for only the named columns, if
+        'infer', use only for columns which don't have a sentinel NULL marker
+        (currently object columns only).
     fixed_text : dict {col: int}
         For column types that are written as bytes (bytes, utf8 strings, or
         json and bson-encoded objects), if a column is included here, the
@@ -333,6 +335,13 @@ def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
     ignore_divisions: bool (False)
         If False raises error when previous divisions overlap with the new
         appended divisions. Ignored if append=False.
+    partition_on: list
+        Construct directory-based partitioning by splitting on these fields'
+        values. Each dask partition will result in one or more datafiles,
+        there will be no global groupby.
+    compute: bool (True)
+        If true (default) then we compute immediately.
+        If False then we return a dask.delayed object for future computation.
 
     This uses the fastparquet project:
     http://fastparquet.readthedocs.io/en/latest
@@ -345,9 +354,9 @@ def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
     See Also
     --------
     read_parquet: Read parquet data to dask.dataframe
-
     """
     import fastparquet
+    partition_on = partition_on or []
 
     fs, paths, myopen = get_fs_paths_myopen(path, None, 'wb',
                                             **(storage_options or {}))
@@ -361,15 +370,19 @@ def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
         index_col = df.columns[0]
     else:
         ignore_divisions = True
+        index_col = None
 
     object_encoding = object_encoding or 'utf8'
     if object_encoding == 'infer' or (isinstance(object_encoding, dict) and
                                       'infer' in object_encoding.values()):
         raise ValueError('"infer" not allowed as object encoding, '
                          'because this required data in memory.')
-    fmd = fastparquet.writer.make_metadata(df._meta, has_nulls=has_nulls,
-                                           fixed_text=fixed_text,
-                                           object_encoding=object_encoding)
+    if set(partition_on) - set(df.columns):
+        raise ValueError('Partitioning on non-existent column')
+    fmd = fastparquet.writer.make_metadata(
+        df._meta, has_nulls=has_nulls, fixed_text=fixed_text,
+        object_encoding=object_encoding, index_cols=[index_col],
+        ignore_columns=partition_on)
 
     if append:
         pf = fastparquet.api.ParquetFile(path, open_with=myopen, sep=sep)
@@ -410,21 +423,43 @@ def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
                  for i in range(i_offset, len(partitions) + i_offset)]
     outfiles = [sep.join([path, fn]) for fn in filenames]
 
-    writes = [delayed(fastparquet.writer.make_part_file)(
-              myopen(outfile, 'wb'), partition, fmd.schema,
-              compression=compression)
-              for outfile, partition in zip(outfiles, partitions)]
+    if partition_on:
+        writes = [delayed(fastparquet.writer.partition_on_columns)(
+            partition, partition_on, path, filename, fmd, sep,
+            compression, fs.open, fs.mkdirs)
+            for filename, partition in zip(filenames, partitions)]
+    else:
+        writes = [delayed(fastparquet.writer.make_part_file)(
+                  myopen(outfile, 'wb'), partition, fmd.schema,
+                  compression=compression)
+                  for outfile, partition in zip(outfiles, partitions)]
 
-    out = delayed(writes).compute()
+    if compute:
+        writes = delayed(writes).compute()
+        _write_metadata(writes, filenames, fmd, path, metadata_fn, myopen, sep)
+    else:
+        out = delayed(_write_metadata)(writes, filenames, fmd, path, metadata_fn,
+                                       myopen, sep)
+        return out
 
-    for fn, rg in zip(filenames, out):
+
+def _write_metadata(writes, filenames, fmd, path, metadata_fn, myopen, sep):
+    """ Write Parquet metadata after writing all row groups
+
+    See Also
+    --------
+    to_parquet
+    """
+    for fn, rg in zip(filenames, writes):
         if rg is not None:
-            for chunk in rg.columns:
-                chunk.file_path = fn
-            fmd.row_groups.append(rg)
+            if isinstance(rg, list):
+                for r in rg:
+                    fmd.row_groups.append(r)
+            else:
+                for chunk in rg.columns:
+                    chunk.file_path = fn
+                fmd.row_groups.append(rg)
 
-    if len(fmd.row_groups) == 0:
-        raise ValueError("All partitions were empty")
     fastparquet.writer.write_common_metadata(metadata_fn, fmd, open_with=myopen,
                                              no_row_groups=False)
 

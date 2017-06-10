@@ -12,8 +12,12 @@ from contextlib import contextmanager
 import numpy as np
 import pandas as pd
 import pandas.util.testing as tm
-from pandas.core.common import is_datetime64tz_dtype
 from pandas.api.types import is_categorical_dtype, is_scalar
+try:
+    from pandas.api.types import is_datetime64tz_dtype
+except ImportError:
+    # pandas < 0.19.2
+    from pandas.core.common import is_datetime64tz_dtype
 
 from ..core import get_deps
 from ..local import get_sync
@@ -290,17 +294,28 @@ def make_meta(x, index=None):
     raise TypeError("Don't know how to create metadata from {0}".format(x))
 
 
+if PANDAS_VERSION >= "0.20.0":
+    _numeric_index_types = (pd.Int64Index, pd.Float64Index, pd.UInt64Index)
+else:
+    _numeric_index_types = (pd.Int64Index, pd.Float64Index)
+
+
 def _nonempty_index(idx):
     typ = type(idx)
     if typ is pd.RangeIndex:
         return pd.RangeIndex(2, name=idx.name)
-    elif typ in (pd.Int64Index, pd.Float64Index):
+    elif typ in _numeric_index_types:
         return typ([1, 2], name=idx.name)
     elif typ is pd.Index:
         return pd.Index(['a', 'b'], name=idx.name)
     elif typ is pd.DatetimeIndex:
         start = '1970-01-01'
-        data = [start, start] if idx.freq is None else None
+        # Need a non-monotonic decreasing index to avoid issues with
+        # partial string indexing see https://github.com/dask/dask/issues/2389
+        # and https://github.com/pandas-dev/pandas/issues/16515
+        # This doesn't mean `_meta_nonempty` should ever rely on
+        # `self.monotonic_increasing` or `self.monotonic_decreasing`
+        data = [start, '1970-01-02'] if idx.freq is None else None
         return pd.DatetimeIndex(data, start=start, periods=2, freq=idx.freq,
                                 tz=idx.tz, name=idx.name)
     elif typ is pd.PeriodIndex:

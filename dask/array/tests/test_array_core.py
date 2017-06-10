@@ -5,8 +5,10 @@ import pytest
 np = pytest.importorskip('numpy')
 
 import os
+import sys
 import time
 from distutils.version import LooseVersion
+import operator
 from operator import add, sub, getitem
 from threading import Lock
 import warnings
@@ -543,9 +545,11 @@ def test_operators():
     assert_eq(c, x + x.reshape((10, 1)))
 
     expr = (3 / a * b)**2 > 5
-    assert_eq(expr, (3 / x * y)**2 > 5)
+    with pytest.warns(None):  # ZeroDivisionWarning
+        assert_eq(expr, (3 / x * y)**2 > 5)
 
-    c = da.exp(a)
+    with pytest.warns(None):  # OverflowWarning
+        c = da.exp(a)
     assert_eq(c, np.exp(x))
 
     assert_eq(abs(-a), a)
@@ -592,7 +596,8 @@ def test_tensordot():
         assert_eq(tensordot(a, y, axes=axes), np.tensordot(x, y, axes=axes))
 
     assert same_keys(tensordot(a, b, axes=(1, 0)), tensordot(a, b, axes=(1, 0)))
-    assert not same_keys(tensordot(a, b, axes=0), tensordot(a, b, axes=1))
+    with pytest.warns(None):  # Increasing number of chunks warning
+        assert not same_keys(tensordot(a, b, axes=0), tensordot(a, b, axes=1))
 
     # assert (tensordot(a, a).chunks
     #      == tensordot(a, a, axes=((1, 0), (0, 1))).chunks)
@@ -624,6 +629,28 @@ def test_dot_method():
     b = from_array(y, chunks=(5, 5))
 
     assert_eq(a.dot(b), x.dot(y))
+
+
+@pytest.mark.skipif(sys.version_info < (3, 5),
+                    reason="Matrix multiplication operator only after Py3.5")
+def test_matmul():
+    x = np.random.random((5, 5))
+    y = np.random.random((5, 2))
+    a = from_array(x, chunks=(1, 5))
+    b = from_array(y, chunks=(5, 1))
+    assert_eq(operator.matmul(a, b), a.dot(b))
+    assert_eq(operator.matmul(a, b), operator.matmul(x, y))
+    assert_eq(operator.matmul(a, y), operator.matmul(x, b))
+    list_vec = list(range(1, 6))
+    assert_eq(operator.matmul(list_vec, b), operator.matmul(list_vec, y))
+    assert_eq(operator.matmul(x, list_vec), operator.matmul(a, list_vec))
+    z = np.random.random((5, 5, 5))
+    with pytest.raises(NotImplementedError):
+        operator.matmul(a, z)
+    c = from_array(z, chunks=(1, 5, 1))
+    with pytest.raises(NotImplementedError):
+        operator.matmul(x, c)
+    assert_eq(operator.matmul(z, a), operator.matmul(c, x))
 
 
 def test_T():
@@ -661,11 +688,36 @@ def test_choose():
 def test_where():
     x = np.random.randint(10, size=(15, 16))
     d = from_array(x, chunks=(4, 5))
-    y = np.random.randint(10, size=15)
+    y = np.random.randint(10, size=15).astype(np.uint8)
     e = from_array(y, chunks=(4,))
 
-    assert_eq(where(d > 5, d, 0), np.where(x > 5, x, 0))
-    assert_eq(where(d > 5, d, -e[:, None]), np.where(x > 5, x, -y[:, None]))
+    for c1, c2 in [(d > 5, x > 5),
+                   (True, True),
+                   (np.True_, np.True_),
+                   (False, False),
+                   (np.False_, np.False_)]:
+        for b1, b2 in [(0, 0), (-e[:, None], -y[:, None])]:
+            w1 = where(c1, d, b1)
+            w2 = np.where(c2, x, b2)
+
+            assert_eq(w1, w2)
+
+
+def test_where_bool_optimization():
+    x = np.random.randint(10, size=(15, 16))
+    d = from_array(x, chunks=(4, 5))
+    y = np.random.randint(10, size=(15, 16))
+    e = from_array(y, chunks=(4, 5))
+
+    for c in [True, False, np.True_, np.False_]:
+        w1 = where(c, d, e)
+        w2 = np.where(c, x, y)
+
+        assert_eq(w1, w2)
+
+        ex_w1 = d if c else e
+
+        assert w1 is ex_w1
 
 
 def test_where_has_informative_error():
@@ -732,12 +784,37 @@ def test_broadcast_to():
     x = np.random.randint(10, size=(5, 1, 6))
     a = from_array(x, chunks=(3, 1, 3))
 
-    for shape in [(5, 4, 6), (2, 5, 1, 6), (3, 4, 5, 4, 6)]:
-        assert_eq(chunk.broadcast_to(x, shape),
-                  broadcast_to(a, shape))
+    for shape in [a.shape, (5, 4, 6), (2, 5, 1, 6), (3, 4, 5, 4, 6)]:
+        xb = chunk.broadcast_to(x, shape)
+        ab = broadcast_to(a, shape)
+
+        assert_eq(xb, ab)
+
+        if a.shape == ab.shape:
+            assert a is ab
 
     pytest.raises(ValueError, lambda: broadcast_to(a, (2, 1, 6)))
     pytest.raises(ValueError, lambda: broadcast_to(a, (3,)))
+
+
+def test_broadcast_to_array():
+    x = np.random.randint(10, size=(5, 1, 6))
+
+    for shape in [(5, 4, 6), (2, 5, 1, 6), (3, 4, 5, 4, 6)]:
+        a = np.broadcast_to(x, shape)
+        d = broadcast_to(x, shape)
+
+        assert_eq(a, d)
+
+
+def test_broadcast_to_scalar():
+    x = 5
+
+    for shape in [tuple(), (2, 3), (5, 4, 6), (2, 5, 1, 6), (3, 4, 5, 4, 6)]:
+        a = np.broadcast_to(x, shape)
+        d = broadcast_to(x, shape)
+
+        assert_eq(a, d)
 
 
 def test_ravel():
@@ -895,6 +972,10 @@ def test_map_blocks():
     e = d.map_blocks(inc, name='increment')
     assert e.name == 'increment'
 
+    e = d.map_blocks(inc, token='increment')
+    assert e.name != 'increment'
+    assert e.name.startswith('increment')
+
     d = from_array(x, chunks=(10, 10))
     e = d.map_blocks(lambda x: x[::2, ::2], chunks=(5, 5), dtype=d.dtype)
 
@@ -1021,6 +1102,8 @@ def test_slicing_with_ndarray():
 
     assert_eq(d[np.arange(8)], x)
     assert_eq(d[np.ones(8, dtype=bool)], x)
+    assert_eq(d[np.array([1])], x[[1]])
+    assert_eq(d[np.array([True])], x[[0]])
 
 
 def test_dtype():
@@ -1399,11 +1482,13 @@ def test_arithmetic():
 
     assert_eq(da.logaddexp(a, b), np.logaddexp(x, y))
     assert_eq(da.logaddexp2(a, b), np.logaddexp2(x, y))
-    assert_eq(da.exp(b), np.exp(y))
+    with pytest.warns(None):  # Overflow warning
+        assert_eq(da.exp(b), np.exp(y))
     assert_eq(da.log(a), np.log(x))
     assert_eq(da.log10(a), np.log10(x))
     assert_eq(da.log1p(a), np.log1p(x))
-    assert_eq(da.expm1(b), np.expm1(y))
+    with pytest.warns(None):  # Overflow warning
+        assert_eq(da.expm1(b), np.expm1(y))
     assert_eq(da.sqrt(a), np.sqrt(x))
     assert_eq(da.square(a), np.square(x))
 
@@ -1416,7 +1501,8 @@ def test_arithmetic():
     assert_eq(da.arctan2(b * 10, a), np.arctan2(y * 10, x))
     assert_eq(da.hypot(b, a), np.hypot(y, x))
     assert_eq(da.sinh(a), np.sinh(x))
-    assert_eq(da.cosh(b), np.cosh(y))
+    with pytest.warns(None):  # Overflow warning
+        assert_eq(da.cosh(b), np.cosh(y))
     assert_eq(da.tanh(a), np.tanh(x))
     assert_eq(da.arcsinh(b * 10), np.arcsinh(y * 10))
     assert_eq(da.arccosh(b * 10), np.arccosh(y * 10))
@@ -1441,7 +1527,8 @@ def test_arithmetic():
     assert_eq(da.signbit(a - 3), np.signbit(x - 3))
     assert_eq(da.copysign(a - 3, b), np.copysign(x - 3, y))
     assert_eq(da.nextafter(a - 3, b), np.nextafter(x - 3, y))
-    assert_eq(da.ldexp(c, c), np.ldexp(z, z))
+    with pytest.warns(None):  # overflow warning
+        assert_eq(da.ldexp(c, c), np.ldexp(z, z))
     assert_eq(da.fmod(a * 12, b), np.fmod(x * 12, y))
     assert_eq(da.floor(a * 0.5), np.floor(x * 0.5))
     assert_eq(da.ceil(a), np.ceil(x))
@@ -1988,7 +2075,8 @@ def test_cov():
 
     assert_eq(da.cov(d), np.cov(x))
     assert_eq(da.cov(d, rowvar=0), np.cov(x, rowvar=0))
-    assert_eq(da.cov(d, ddof=10), np.cov(x, ddof=10))
+    with pytest.warns(None):  # warning dof <= 0 for slice
+        assert_eq(da.cov(d, ddof=10), np.cov(x, ddof=10))
     assert_eq(da.cov(d, bias=1), np.cov(x, bias=1))
     assert_eq(da.cov(d, d), np.cov(x, x))
 
@@ -2071,6 +2159,7 @@ def test_view():
 def test_view_fortran():
     x = np.asfortranarray(np.arange(64).reshape((8, 8)))
     d = da.from_array(x, chunks=(2, 3))
+    # TODO: DeprecationWarning: Changing the shape of non-C contiguous array by
     assert_eq(x.view('i4'), d.view('i4', order='F'))
     assert_eq(x.view('i2'), d.view('i2', order='F'))
 
@@ -2217,6 +2306,13 @@ def test_to_delayed():
     assert a.compute() == s
 
 
+def test_to_delayed_optimizes():
+    x = da.ones((4, 4), chunks=(2, 2))
+    y = x[1:][1:][1:][:, 1:][:, 1:][:, 1:]
+    d = y.to_delayed().flatten().tolist()[0]
+    assert len([k for k in d.dask if k[0].startswith('getitem')]) == 1
+
+
 def test_cumulative():
     x = da.arange(20, chunks=5)
     assert_eq(x.cumsum(axis=0), np.arange(20).cumsum())
@@ -2338,11 +2434,11 @@ def test_tril_triu():
 
 
 def test_tril_triu_errors():
-    A = np.random.random_integers(0, 10, (10, 10, 10))
+    A = np.random.randint(0, 11, (10, 10, 10))
     dA = da.from_array(A, chunks=(5, 5, 5))
     pytest.raises(ValueError, lambda: da.triu(dA))
 
-    A = np.random.random_integers(0, 10, (30, 35))
+    A = np.random.randint(0, 11, (30, 35))
     dA = da.from_array(A, chunks=(5, 5))
     pytest.raises(NotImplementedError, lambda: da.triu(dA))
 
@@ -2759,7 +2855,8 @@ def test_no_chunks_2d():
     x = da.from_array(X, chunks=(2, 2))
     x._chunks = ((np.nan, np.nan), (np.nan, np.nan, np.nan))
 
-    assert_eq(da.log(x), np.log(X))
+    with pytest.warns(None):  # zero division warning
+        assert_eq(da.log(x), np.log(X))
     assert_eq(x.T, X.T)
     assert_eq(x.sum(axis=0, keepdims=True), X.sum(axis=0, keepdims=True))
     assert_eq(x.sum(axis=1, keepdims=True), X.sum(axis=1, keepdims=True))
@@ -2862,6 +2959,8 @@ def test_setitem_2d():
     assert_eq(x, dx)
 
 
+@pytest.mark.skipif(np.__version__ >= '1.13.0',
+                    reason='boolean slicing rules changed')
 def test_setitem_mixed_d():
     x = np.arange(24).reshape((4, 6))
     dx = da.from_array(x, chunks=(2, 2))
@@ -3016,3 +3115,11 @@ def test_constructor_plugin():
 
     assert isinstance(y, np.ndarray)
     assert len(L) == 2
+
+
+def test_no_warnings_on_metadata():
+    x = da.ones(5, chunks=3)
+    with warnings.catch_warnings(record=True) as record:
+        da.arccos(x)
+
+    assert not record

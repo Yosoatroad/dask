@@ -4,8 +4,10 @@ from __future__ import absolute_import, division, print_function
 import pytest
 import math
 import os
+import random
 import sys
 from collections import Iterator
+from itertools import repeat
 
 import partd
 from toolz import merge, join, filter, identity, valmap, groupby, pluck
@@ -439,17 +441,35 @@ def test_map_partitions():
     assert b.map_partitions(lambda a: len(a) + 1).name != b.map_partitions(len).name
 
 
-def test_map_partitions_with_kwargs():
-    b = db.from_sequence(range(100), npartitions=10)
+def test_map_partitions_args_kwargs():
+    x = [random.randint(-100, 100) for i in range(100)]
+    y = [random.randint(-100, 100) for i in range(100)]
 
-    def scale(X, factor=1, total=1):
-        return [x * factor / total for x in X]
+    dx = db.from_sequence(x, npartitions=10)
+    dy = db.from_sequence(y, npartitions=10)
 
-    assert b.map_partitions(scale, factor=2).sum().compute() == 9900.0
-    assert b.map_partitions(scale, total=b.sum()).sum().compute() == 1.0
-    assert b.map_partitions(scale, total=b.sum(), factor=2).sum().compute() == 2.0
-    total = dask.delayed(sum)(list(range(100)))
-    assert b.map_partitions(scale, total=total, factor=2).sum().compute() == 2.0
+    def maximum(x, y=0):
+        y = repeat(y) if isinstance(y, int) else y
+        return [max(a, b) for (a, b) in zip(x, y)]
+
+    sol = maximum(x, y=10)
+    assert db.map_partitions(maximum, dx, y=10).compute() == sol
+    assert dx.map_partitions(maximum, y=10).compute() == sol
+    assert dx.map_partitions(maximum, 10).compute() == sol
+
+    sol = maximum(x, y)
+    assert db.map_partitions(maximum, dx, dy).compute() == sol
+    assert dx.map_partitions(maximum, y=dy).compute() == sol
+    assert dx.map_partitions(maximum, dy).compute() == sol
+
+    dy_mean = dy.mean().apply(int)
+    sol = maximum(x, int(sum(y) / len(y)))
+    assert dx.map_partitions(maximum, y=dy_mean).compute() == sol
+    assert dx.map_partitions(maximum, dy_mean).compute() == sol
+
+    dy_mean = dask.delayed(dy_mean)
+    assert dx.map_partitions(maximum, y=dy_mean).compute() == sol
+    assert dx.map_partitions(maximum, dy_mean).compute() == sol
 
 
 def test_random_sample_size():
@@ -736,13 +756,14 @@ def test_concat():
     b = db.from_sequence([4, 5, 6])
     c = db.concat([a, b])
     assert list(c) == [1, 2, 3, 4, 5, 6]
-
     assert c.name == db.concat([a, b]).name
-    assert b.concat().name != a.concat().name
-    assert b.concat().name == b.concat().name
 
-    b = db.from_sequence([1, 2, 3]).map(lambda x: x * [1, 2, 3])
-    assert list(b.concat()) == [1, 2, 3] * sum([1, 2, 3])
+
+def test_flatten():
+    b = db.from_sequence([[1], [2, 3]])
+    assert list(b.flatten()) == [1, 2, 3]
+    assert list(b.flatten()) == list(b.concat())
+    assert b.flatten().name == b.flatten().name
 
 
 def test_concat_after_map():
@@ -981,6 +1002,23 @@ def test_to_delayed():
     assert t.compute() == 21
 
 
+def test_to_delayed_optimizes():
+    b = db.from_sequence([1, 2, 3, 4, 5, 6], npartitions=1)
+    b2 = b.map(inc).map(inc).map(inc)
+
+    [d] = b2.to_delayed()
+    text = str(dict(d.dask))
+    assert text.count('reify') == 1
+
+    d = b2.sum().to_delayed()
+    text = str(dict(d.dask))
+    assert text.count('reify') == 0
+
+    [d] = b2.to_textfiles('foo.txt', compute=False)
+    text = str(dict(d.dask))
+    assert text.count('reify') <= 0
+
+
 def test_from_delayed():
     from dask.delayed import delayed
     a, b, c = delayed([1, 2, 3]), delayed([4, 5, 6]), delayed([7, 8, 9])
@@ -1006,7 +1044,7 @@ def test_from_delayed_iterator():
     assert db.compute(
         bag.count(),
         bag.pluck('operations').count(),
-        bag.pluck('operations').concat().count(),
+        bag.pluck('operations').flatten().count(),
         get=dask.get,
     ) == (25, 25, 50)
 

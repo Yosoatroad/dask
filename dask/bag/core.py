@@ -37,7 +37,7 @@ from ..delayed import Delayed
 from ..multiprocessing import get as mpget
 from ..optimize import fuse, cull, inline, dont_optimize
 from ..utils import (system_encoding, takes_multiple_arguments, funcname,
-                     digit, insert)
+                     digit, insert, ensure_dict)
 
 
 no_default = '__no__default__'
@@ -48,15 +48,20 @@ no_result = type('no_result', (object,),
 
 def lazify_task(task, start=True):
     """
-    Given a task, remove unnecessary calls to ``list``
+    Given a task, remove unnecessary calls to ``list`` and ``reify``
+
+    This traverses tasks and small lists.  We choose not to traverse down lists
+    of size >= 50 because it is unlikely that sequences this long contain other
+    sequences in practice.
 
     Examples
     --------
-
     >>> task = (sum, (list, (map, inc, [1, 2, 3])))  # doctest: +SKIP
     >>> lazify_task(task)  # doctest: +SKIP
     (sum, (map, inc, [1, 2, 3]))
     """
+    if type(task) is list and len(task) < 50:
+        return [lazify_task(arg, False) for arg in task]
     if not istask(task):
         return task
     head, tail = task[0], task[1:]
@@ -167,10 +172,16 @@ def to_textfiles(b, path, name_function=None, compression='infer',
 
     >>> b_dict.map(json.dumps).to_textfiles("/path/to/data/*.json")  # doctest: +SKIP
     """
-    out = write_bytes(b.to_delayed(), path, name_function, compression,
-                      encoding=encoding)
+    from dask import delayed
+    writes = write_bytes(b.to_delayed(), path, name_function, compression,
+                         encoding=encoding)
+
+    # Use Bag optimizations on these delayed objects
+    dsk = ensure_dict(delayed(writes).dask)
+    dsk2 = Bag._optimize(dsk, [w.key for w in writes])
+    out = [Delayed(w.key, dsk2) for w in writes]
+
     if compute:
-        from dask import delayed
         get = get or _globals.get('get', None) or Bag._default_get
         delayed(out).compute(get=get)
     else:
@@ -271,7 +282,7 @@ class Item(Base):
         if not isinstance(value, Delayed) and hasattr(value, 'key'):
             value = delayed(value)
         assert isinstance(value, Delayed)
-        return Item(value.dask, value.key)
+        return Item(ensure_dict(value.dask), value.key)
 
     def __init__(self, dsk, key):
         self.dask = dsk
@@ -304,7 +315,8 @@ class Item(Base):
         Returns a single value.
         """
         from dask.delayed import Delayed
-        return Delayed(self.key, self.dask)
+        dsk = self._optimize(self.dask, [self.key])
+        return Delayed(self.key, dsk)
 
 
 class Bag(Base):
@@ -369,8 +381,8 @@ class Bag(Base):
         Notes
         -----
         For calls with multiple `Bag` arguments, corresponding partitions
-        should have the same length; if they do not, the "extra" elements from
-        the longer partition(s) will be dropped.
+        should have the same length; if they do not, the call will error at
+        compute time.
 
         Examples
         --------
@@ -551,16 +563,18 @@ class Bag(Base):
                    for i in range(self.npartitions))
         return type(self)(merge(self.dask, dsk), name, self.npartitions)
 
-    def map_partitions(self, func, **kwargs):
-        """ Apply function to every partition within collection
+    def map_partitions(self, func, *args, **kwargs):
+        """Apply a function to every partition across one or more bags.
 
-        Note that this requires you to understand how dask.bag partitions your
-        data and so is somewhat internal.
+        Note that all ``Bag`` arguments must be partitioned identically.
 
-        >>> b.map_partitions(myfunc)  # doctest: +SKIP
-
-        Keyword arguments are passed through to ``func``. These can be either
-        ``dask.bag.Item``, ``dask.delayed.Delayed``, or normal python objects.
+        Parameters
+        ----------
+        func : callable
+        *args, **kwargs : Bag, Item, Delayed, or object
+            Arguments and keyword arguments to pass to ``func``.
+            Partitions from this bag will be the first argument, and these will
+            be passed *after*.
 
         Examples
         --------
@@ -586,17 +600,7 @@ class Bag(Base):
         single graph, and then computes everything at once, and in some cases
         may be more efficient.
         """
-        name = 'map-partitions-{0}-{1}'.format(funcname(func),
-                                               tokenize(self, func, kwargs))
-        dsk = self.dask.copy()
-        if kwargs:
-            kw_dsk, kwargs = unpack_scalar_dask_kwargs(kwargs)
-            dsk.update(kw_dsk)
-            task = lambda i: (apply, func, [(self.name, i)], kwargs)
-        else:
-            task = lambda i: (func, (self.name, i))
-        dsk.update(((name, i), task(i)) for i in range(self.npartitions))
-        return type(self)(dsk, name, self.npartitions)
+        return map_partitions(func, self, *args, **kwargs)
 
     def pluck(self, key, default=no_default):
         """ Select item from all tuples/dicts in collection
@@ -1040,20 +1044,24 @@ class Bag(Base):
     def _keys(self):
         return [(self.name, i) for i in range(self.npartitions)]
 
-    def concat(self):
+    def flatten(self):
         """ Concatenate nested lists into one long list
 
         >>> b = from_sequence([[1], [2, 3]])
         >>> list(b)
         [[1], [2, 3]]
 
-        >>> list(b.concat())
+        >>> list(b.flatten())
         [1, 2, 3]
         """
-        name = 'concat-' + tokenize(self)
+        name = 'flatten-' + tokenize(self)
         dsk = dict(((name, i), (list, (toolz.concat, (self.name, i))))
                    for i in range(self.npartitions))
         return type(self)(merge(self.dask, dsk), name, self.npartitions)
+
+    def concat(self):
+        warn("Deprecated.  Use the .flatten method instead")
+        return self.flatten()
 
     def __iter__(self):
         return iter(self.compute())
@@ -1076,7 +1084,7 @@ class Bag(Base):
         npartitions: int
             If using the disk-based shuffle, the number of output partitions
         blocksize: int
-            If using the disk-based shuffle, the size of shuffle blocks
+            If using the disk-based shuffle, the size of shuffle blocks (bytes)
         max_branch: int
             If using the task-based shuffle, the amount of splitting each
             partition undergoes.  Increase this for fewer copies but more
@@ -1169,7 +1177,8 @@ class Bag(Base):
         Returns list of Delayed, one per partition.
         """
         from dask.delayed import Delayed
-        return [Delayed(k, self.dask) for k in self._keys()]
+        dsk = self._optimize(self.dask, self._keys())
+        return [Delayed(k, dsk) for k in self._keys()]
 
     def repartition(self, npartitions):
         """ Coalesce bag into fewer partitions
@@ -1423,7 +1432,7 @@ def from_delayed(values):
               if not isinstance(v, Delayed) and hasattr(v, 'key')
               else v
               for v in values]
-    dsk = merge(v.dask for v in values)
+    dsk = merge(ensure_dict(v.dask) for v in values)
 
     name = 'bag-from-delayed-' + tokenize(*values)
     names = [(name, i) for i in range(len(values))]
@@ -1580,7 +1589,7 @@ def unpack_scalar_dask_kwargs(kwargs):
     kwargs2 = {}
     for k, v in kwargs.items():
         if isinstance(v, (Delayed, Item)):
-            dsk.update(v.dask)
+            dsk.update(ensure_dict(v.dask))
             kwargs2[k] = v.key
         elif isinstance(v, Base):
             raise NotImplementedError("dask.bag doesn't support kwargs of "
@@ -1607,8 +1616,7 @@ def bag_map(func, *args, **kwargs):
     Notes
     -----
     For calls with multiple `Bag` arguments, corresponding partitions should
-    have the same length; if they do not, the "extra" elements from the longer
-    partition(s) will be dropped.
+    have the same length; if they do not, the call will error at compute time.
 
     Examples
     --------
@@ -1661,7 +1669,7 @@ def bag_map(func, *args, **kwargs):
             dsk.update(a.dask)
         elif isinstance(a, (Item, Delayed)):
             args2.append((itertools.repeat, a.key))
-            dsk.update(a.dask)
+            dsk.update(ensure_dict(a.dask))
         else:
             args2.append((itertools.repeat, a))
 
@@ -1698,6 +1706,90 @@ def bag_map(func, *args, **kwargs):
     dsk.update({(name, n): (reify, (map_chunk, func, build_args(n),
                                     build_bag_kwargs(n), other_kwargs))
                 for n in range(npartitions)})
+
+    # If all bags are the same type, use that type, otherwise fallback to Bag
+    return_type = set(map(type, bags))
+    return_type = return_type.pop() if len(return_type) == 1 else Bag
+
+    return return_type(dsk, name, npartitions)
+
+
+def map_partitions(func, *args, **kwargs):
+    """Apply a function to every partition across one or more bags.
+
+    Note that all ``Bag`` arguments must be partitioned identically.
+
+    Parameters
+    ----------
+    func : callable
+    *args, **kwargs : Bag, Item, Delayed, or object
+        Arguments and keyword arguments to pass to ``func``.
+
+    Examples
+    --------
+    >>> import dask.bag as db
+    >>> b = db.from_sequence(range(1, 101), npartitions=10)
+    >>> def div(nums, den=1):
+    ...     return [num / den for num in nums]
+
+    Using a python object:
+
+    >>> hi = b.max().compute()
+    >>> hi
+    100
+    >>> b.map_partitions(div, den=hi).take(5)
+    (0.01, 0.02, 0.03, 0.04, 0.05)
+
+    Using an ``Item``:
+
+    >>> b.map_partitions(div, den=b.max()).take(5)
+    (0.01, 0.02, 0.03, 0.04, 0.05)
+
+    Note that while both versions give the same output, the second forms a
+    single graph, and then computes everything at once, and in some cases
+    may be more efficient.
+    """
+    name = 'map-partitions-%s-%s' % (funcname(func),
+                                     tokenize(func, args, kwargs))
+
+    # Extract bag arguments, build initial graph
+    bags = []
+    dsk = {}
+    for vals in [args, kwargs.values()]:
+        for a in vals:
+            if isinstance(a, (Bag, Item, Delayed)):
+                dsk.update(ensure_dict(a.dask))
+                if isinstance(a, Bag):
+                    bags.append(a)
+            elif isinstance(a, Base):
+                raise NotImplementedError("dask.bag doesn't support args of "
+                                          "type %s" % type(a).__name__)
+
+    if not bags:
+        raise ValueError("At least one argument must be a Bag.")
+
+    npartitions = {b.npartitions for b in bags}
+    if len(npartitions) > 1:
+        raise ValueError("All bags must have the same number of partitions.")
+    npartitions = npartitions.pop()
+
+    def build_task(n):
+        args2 = [(a.name, n) if isinstance(a, Bag) else a.key
+                 if isinstance(a, (Item, Delayed)) else a for a in args]
+
+        if any(isinstance(v, (Bag, Item, Delayed)) for v in kwargs.values()):
+            vals = [(v.name, n) if isinstance(v, Bag) else v.key
+                    if isinstance(v, (Item, Delayed)) else v
+                    for v in kwargs.values()]
+            kwargs2 = (dict, (zip, list(kwargs), vals))
+        else:
+            kwargs2 = kwargs
+
+        if kwargs2 or len(args2) > 1:
+            return (apply, func, args2, kwargs2)
+        return (func, args2[0])
+
+    dsk.update({(name, n): build_task(n) for n in range(npartitions)})
 
     # If all bags are the same type, use that type, otherwise fallback to Bag
     return_type = set(map(type, bags))
